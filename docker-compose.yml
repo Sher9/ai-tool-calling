@@ -1,0 +1,302 @@
+# 企业内部私有化 AI Agent 工具调度平台
+# 一键编排：pgvector + redis + minio + backend + frontend
+# 以及一套基于 Spring Cloud 的「仿真业务微服务」（CRM / HR / 财务 / OA）
+# 组件：Eureka 注册中心 + Gateway 网关 + 4 个业务微服务
+#
+# 使用：cp backend/.env.example backend/.env  &&  docker compose up --build
+#
+# 端口规划：
+#   Agent 平台后端        8000
+#   前端                  5173
+#   Eureka 注册中心       8761
+#   Gateway 统一网关      8080  （后端经此访问各业务微服务）
+#   CRM  微服务           8081
+#   HR   微服务           8082
+#   财务 微服务           8083
+#   OA   微服务           8084
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: agent-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "123456"
+      POSTGRES_DB: agent_platform
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # 初始化脚本：创建四个业务系统各自独立的数据库（Agent 库由 POSTGRES_DB 自动创建）
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d agent_platform"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: agent-redis
+    command: ["redis-server", "--requirepass", "123456"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "123456", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: agent-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 引导服务：compose 启动时自动创建存储桶并设为可下载，避免首次上传才懒建桶
+  minio-init:
+    image: minio/mc:latest
+    container_name: agent-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/agent-platform &&
+      echo 'MinIO 初始化完成：bucket=agent-platform'
+      "
+    restart: "no"
+
+  # 本地 Embedding 服务（bge-small-zh-v1.5，OpenAI 兼容 /v1/embeddings）
+  # 让 RAG 在纯私有化、无外网环境下跑通向量召回，无需调用 8000 后端自身。
+  embedding:
+    build:
+      context: ./backend
+      dockerfile: embedding_service/Dockerfile
+    container_name: agent-embedding
+    environment:
+      EMBEDDING_MODEL: BAAI/bge-small-zh-v1.5
+      EMBEDDING_PORT: "8088"
+      HF_HOME: /data/models
+    volumes:
+      - embedding_models:/data/models
+    ports:
+      - "8088:8088"
+    restart: on-failure
+
+  # 本地 Rerank 服务（bge-reranker-v2-m3，OpenAI 兼容 /rerank）
+  rerank:
+    build:
+      context: ./backend
+      dockerfile: rerank_service/Dockerfile
+    container_name: agent-rerank
+    environment:
+      RERANK_MODEL: BAAI/bge-reranker-v2-m3
+      RERANK_PORT: "8089"
+      HF_HOME: /data/models
+    volumes:
+      - embedding_models:/data/models
+    ports:
+      - "8089:8089"
+    restart: on-failure
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: agent-backend
+    env_file:
+      - ./backend/.env
+    environment:
+      # 容器内通过服务名访问依赖
+      DATABASE_URL: postgresql+asyncpg://postgres:123456@postgres:5432/agent_platform
+      DB_DSN_SYNC: postgresql+psycopg2://postgres:123456@postgres:5432/agent_platform
+      REDIS_URL: redis://:123456@redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      # 业务系统：统一经 Gateway 网关访问（路径前缀 /crm /hr /finance /oa）
+      # 令牌与各业务微服务 SERVICE_TOKEN 一致，由网关透传
+      CRM_BASE_URL: http://gateway:8080/crm
+      CRM_TOKEN: biz-svc-2026-token
+      HR_BASE_URL: http://gateway:8080/hr
+      HR_TOKEN: biz-svc-2026-token
+      FINANCE_BASE_URL: http://gateway:8080/finance
+      FINANCE_TOKEN: biz-svc-2026-token
+      OA_BASE_URL: http://gateway:8080/oa
+      OA_TOKEN: biz-svc-2026-token
+      # 自定义内部业务接口（库存/产品参数/资源申请/报价单）统一接入 biz 服务
+      BIZ_BASE_URL: http://biz:8085
+      BIZ_TOKEN: biz-svc-2026-token
+      # 容器内通过服务名访问本地模型服务（非本项目后端自身）
+      EMBEDDING_BASE_URL: http://embedding:8088/v1
+      RERANK_BASE_URL: http://rerank:8089
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      gateway:
+        condition: service_started
+      embedding:
+        condition: service_started
+      rerank:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    command: >
+      sh -c "python seed.py &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: agent-frontend
+    environment:
+      # Vite 代理目标（容器网络内使用服务名）
+      VITE_PROXY_TARGET: http://backend:8000
+    depends_on:
+      - backend
+    ports:
+      - "5173:5173"
+
+  # ===================== Spring Cloud 仿真业务微服务 =====================
+  eureka-server:
+    build:
+      context: ./business-systems
+      dockerfile: eureka-server/Dockerfile
+    container_name: biz-eureka
+    ports:
+      - "8761:8761"
+    restart: on-failure
+
+  gateway:
+    build:
+      context: ./business-systems
+      dockerfile: gateway/Dockerfile
+    container_name: biz-gateway
+    environment:
+      EUREKA_URL: http://eureka-server:8761/eureka/
+    ports:
+      - "8080:8080"
+    depends_on:
+      - eureka-server
+    restart: on-failure
+
+  crm-service:
+    build:
+      context: ./business-systems
+      dockerfile: crm-service/Dockerfile
+    container_name: biz-crm
+    environment:
+      CRM_DATABASE_URL: jdbc:postgresql://postgres:5432/crm_db
+      DB_USERNAME: postgres
+      DB_PASSWORD: "123456"
+      EUREKA_URL: http://eureka-server:8761/eureka/
+      SERVICE_TOKEN: biz-svc-2026-token
+    depends_on:
+      postgres:
+        condition: service_healthy
+      eureka-server:
+        condition: service_started
+    ports:
+      - "8081:8081"
+    restart: on-failure
+
+  hr-service:
+    build:
+      context: ./business-systems
+      dockerfile: hr-service/Dockerfile
+    container_name: biz-hr
+    environment:
+      HR_DATABASE_URL: jdbc:postgresql://postgres:5432/hr_db
+      DB_USERNAME: postgres
+      DB_PASSWORD: "123456"
+      EUREKA_URL: http://eureka-server:8761/eureka/
+      SERVICE_TOKEN: biz-svc-2026-token
+    depends_on:
+      postgres:
+        condition: service_healthy
+      eureka-server:
+        condition: service_started
+    ports:
+      - "8082:8082"
+    restart: on-failure
+
+  finance-service:
+    build:
+      context: ./business-systems
+      dockerfile: finance-service/Dockerfile
+    container_name: biz-finance
+    environment:
+      FINANCE_DATABASE_URL: jdbc:postgresql://postgres:5432/finance_db
+      DB_USERNAME: postgres
+      DB_PASSWORD: "123456"
+      EUREKA_URL: http://eureka-server:8761/eureka/
+      SERVICE_TOKEN: biz-svc-2026-token
+    depends_on:
+      postgres:
+        condition: service_healthy
+      eureka-server:
+        condition: service_started
+    ports:
+      - "8083:8083"
+    restart: on-failure
+
+  oa-service:
+    build:
+      context: ./business-systems
+      dockerfile: oa-service/Dockerfile
+    container_name: biz-oa
+    environment:
+      OA_DATABASE_URL: jdbc:postgresql://postgres:5432/oa_db
+      DB_USERNAME: postgres
+      DB_PASSWORD: "123456"
+      EUREKA_URL: http://eureka-server:8761/eureka/
+      SERVICE_TOKEN: biz-svc-2026-token
+    depends_on:
+      postgres:
+        condition: service_healthy
+      eureka-server:
+        condition: service_started
+    ports:
+      - "8084:8084"
+    restart: on-failure
+
+  # 自定义内部业务接口服务（库存 / 产品参数 / 资源申请 / 报价单）
+  # 由 Agent 后端直接调用（不走 Spring Cloud 网关），独立库 biz_db
+  biz-service:
+    build:
+      context: ./business-systems
+      dockerfile: biz/Dockerfile
+    container_name: biz-service
+    environment:
+      BIZ_DATABASE_URL: postgresql+asyncpg://postgres:123456@postgres:5432/biz_db
+      SERVICE_TOKEN: biz-svc-2026-token
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8085:8085"
+    restart: on-failure
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  embedding_models:

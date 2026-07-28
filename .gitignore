@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Env / secrets
+.env
+.env.local
+
+# Node
+node_modules/
+frontend/dist/
+
+# Runtime data
+backend/data/
+*.log
+
+# Service runtime logs & temp scripts (regenerated at runtime)
+*.err
+*.out
+_tmp_*.py
+
+# Maven build artifacts (Spring Cloud 微服务)
+business-systems/**/target/
+*.class

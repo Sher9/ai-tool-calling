@@ -1,0 +1,11 @@
+# Local Embedding service deps (separated from main backend to avoid heavy torch in the platform)
+fastapi==0.115.0
+uvicorn[standard]==0.34.0
+# Chinese embedding model bge-small-zh-v1.5 (512-dim, ~90MB)
+sentence-transformers==3.1.1
+# torch is large; CPU wheel is fine for this 90MB model.
+# For CUDA 12.1 GPU, replace the torch line with:
+# torch==2.4.1+cu121 -f https://download.pytorch.org/whl/torch_stable.html
+torch==2.4.1
+numpy==2.1.1
+pydantic==2.11.7

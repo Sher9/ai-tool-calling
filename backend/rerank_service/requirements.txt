@@ -1,0 +1,10 @@
+# Local Rerank service deps (separated from main backend to avoid heavy torch in the platform)
+fastapi==0.115.0
+uvicorn[standard]==0.34.0
+# Cross-encoder rerank model bge-reranker-v2-m3 (multilingual, ~2.3GB)
+sentence-transformers==3.1.1
+# torch is large; CPU wheel works but is slower. For CUDA 12.1 GPU use:
+# torch==2.4.1+cu121 -f https://download.pytorch.org/whl/torch_stable.html
+torch==2.4.1
+numpy==2.1.1
+pydantic==2.11.7
